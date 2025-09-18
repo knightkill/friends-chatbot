@@ -12,3 +12,4 @@ tokenizers
 accelerate
 langchain-huggingface
 sentence-transformers
+langchain_openai

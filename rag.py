@@ -15,12 +15,17 @@ from langchain_qdrant import QdrantVectorStore
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.embeddings import FastEmbedEmbeddings
 from qdrant_client import QdrantClient
+from qdrant_client.models import Filter, FieldCondition, Range, MatchValue
 import os
+import re
+from collections import Counter
+import math
+
+import llm_providers
 
 load_dotenv()
 
 client = QdrantClient(url=os.environ.get("QDRANT_URL"), api_key=os.environ.get("QDRANT_API_KEY"))
-# Initialize vector database
 emb = FastEmbedEmbeddings(model_name="jinaai/jina-embeddings-v2-base-en")
 vdb = QdrantVectorStore(client=client, collection_name="friends-rag", embedding=emb)
 
@@ -30,81 +35,131 @@ class State(TypedDict, total=False):
   context: str
   answer: str
   sources: List[str]
+  chat_history: List[tuple]  # [(role, message), ...]
 
-MODEL_ID = "google/gemma-3-1b-it"
-
-tok = AutoTokenizer.from_pretrained(MODEL_ID)
-mdl = AutoModelForCausalLM.from_pretrained(
-    MODEL_ID,
-    device_map="auto"
-)
-
-gen_pipe = pipeline(
-    "text-generation",
-    model=mdl,
-    tokenizer=tok,
-    max_new_tokens=512,          # Increased for more complete answers
-    do_sample=True,              # Enable sampling for more natural responses
-    temperature=0.3,             # Low temperature for factual consistency
-    top_p=0.9,                   # Nucleus sampling for better quality
-    repetition_penalty=1.2,      # Slightly higher to avoid repetition
-    return_full_text=False,
-    pad_token_id=tok.eos_token_id  # Proper padding token
-)
-hf_llm = HuggingFacePipeline(pipeline=gen_pipe)
-llm = ChatHuggingFace(llm=hf_llm, tokenizer=tok)
+llm = llm_providers.get_llm_provider().get_llm()
 
 prompt = ChatPromptTemplate.from_messages([
-    ("system", """You are an expert on the TV series Friends (1994-2004) with comprehensive knowledge of all characters, episodes, storylines, and relationships.
+    ("system", """You are a friendly Friends expert who loves chatting about the show! You have deep knowledge of all characters, episodes, and storylines from Friends (1994-2004).
 
-Your task is to answer questions about Friends using the provided context. Follow these guidelines:
+CHAT STYLE:
+- Be conversational and enthusiastic about Friends
+- Use natural, friendly language like you're talking to a fellow fan
+- Feel free to add fun details or trivia when relevant
+- Keep responses engaging but concise
 
-ACCURACY RULES:
-- Only answer if the context contains relevant information
-- If uncertain, say "I don't have enough information to answer that confidently"
-- Distinguish between facts and speculation clearly
-- Cite specific episodes/seasons when mentioned in context
-
-RESPONSE FORMAT:
-- Give direct, factual answers first
-- Include character full names when relevant (e.g., "Rachel Green" not just "Rachel")
-- For list questions, provide complete lists when available in context
-- Add helpful context about relationships or episodes when it enhances understanding
-
-CONFIDENCE LEVELS:
-- High confidence: "Based on the show..." or "According to Friends..."
-- Medium confidence: "From what I can find in the context..."
-- Low confidence: "I don't have enough information to answer that confidently"
-
-CHARACTER REFERENCE (use full names when appropriate):
-- Rachel Green, Ross Geller, Monica Geller, Chandler Bing, Joey Tribbiani, Phoebe Buffay
+ACCURACY:
+- Only answer using the provided context
+- If you're not sure, just say "I'm not certain about that one" or "I don't have that info handy"
+- Mention episodes or seasons when they're in the context
 
 EXAMPLES:
-Q: What was the name of Rachel's sisters?
-A: Based on the show, Rachel Green had two sisters: Jill Green and Amy Green. Jill appeared in Season 6 and was played by Reese Witherspoon, while Amy appeared in Season 9-10 and was played by Christina Applegate.
+"Tell me about Rachel's sisters"
+→ "Oh, Rachel had two sisters! There's Jill Green, who appeared in Season 6 (played by Reese Witherspoon), and Amy Green from Seasons 9-10 (Christina Applegate). Both visits were pretty chaotic for the group!"
 
-Q: How many times was Ross married?
-A: According to Friends, Ross Geller was married three times throughout the series: first to Carol Willick, then to Emily Waltham, and finally to Rachel Green (though they got married twice if you count the Vegas wedding separately).
+"Who is Gunther?"
+→ "Gunther is the manager of Central Perk! He's got that distinctive bleached blonde hair and has been harboring a major crush on Rachel for years. He's always there in the background serving coffee."
 
-Q: What is Central Perk?
-A: Central Perk is the coffee shop where the main characters frequently hang out throughout the series. It serves as one of the primary meeting places for the group."""),
-    ("user", "Context from Friends episodes:\n{context}\n\nQuestion: {question}\n\nAnswer:")
+Remember: Keep it friendly and conversational, like chatting with a Friends fan!"""),
+    ("user", "Context from Friends episodes:\n{context}\n\nChat History:\n{chat_history}\n\nCurrent Question: {question}\n\nAnswer:")
 ])
 
+def estimate_tokens(text: str) -> int:
+    """Rough token estimation (1 token ≈ 4 characters)"""
+    return len(text) // 4
+
+def format_chat_history(history: List[tuple], max_turns: int = 3) -> str:
+    """Format recent chat history for context (limit to last few turns)"""
+    if not history:
+        return "No previous conversation."
+
+    # Take last max_turns conversations
+    recent_history = history[-max_turns*2:] if len(history) > max_turns*2 else history
+
+    formatted = []
+    for role, message in recent_history:
+        if role == "user":
+            formatted.append(f"Human: {message}")
+        else:
+            formatted.append(f"Assistant: {message}")
+
+    return "\n".join(formatted) if formatted else "No previous conversation."
+
+def format_context(docs: List, max_tokens: int = 2000) -> str:
+    """Enhanced context formatting with metadata and token limits"""
+    formatted_contexts = []
+    total_tokens = 0
+
+    for doc in docs:
+        metadata = doc.metadata
+        content = doc.page_content.strip()
+
+        # Add source information if available
+        source_info = ""
+        if "episode" in metadata:
+            source_info = f"[Episode {metadata['episode']}] "
+        elif "season" in metadata:
+            source_info = f"[Season {metadata['season']}] "
+        elif "source" in metadata and metadata["source"]:
+            source_info = f"[{metadata['source']}] "
+
+        # Format context with source info
+        formatted_content = f"{source_info}{content}"
+        content_tokens = estimate_tokens(formatted_content)
+
+        # Check token limits
+        if total_tokens + content_tokens <= max_tokens:
+            formatted_contexts.append(formatted_content)
+            total_tokens += content_tokens
+        else:
+            # Truncate last document if it would exceed limit
+            remaining_tokens = max_tokens - total_tokens
+            if remaining_tokens > 100:  # Only add if meaningful content fits
+                truncated_content = formatted_content[:remaining_tokens * 4]
+                formatted_contexts.append(truncated_content + "...")
+            break
+
+    return "\n\n".join(formatted_contexts)
+
 def retrieve(s: State) -> State:
-  k = s.get("k", 3)
-  docs = vdb.max_marginal_relevance_search(s["question"], k=k)
-  s["context"] = "\n\n---\n\n".join(d.page_content for d in docs)
-  s["sources"] = [d.metadata.get("source","") for d in docs]
-  return s
+    k = s.get("k", 3)
+
+    try:
+        all_docs = []
+
+        # Dense search
+        mmr_docs = vdb.max_marginal_relevance_search(s["question"], k=k)
+        all_docs.extend(mmr_docs)
+
+        # Sparse search
+        sparse_docs = vdb.similarity_search(s["question"], k=k//2 + 1)
+        all_docs.extend(sparse_docs)
+
+        if not all_docs:
+            s["context"] = "No relevant information found in the database."
+            s["sources"] = []
+            return s
+
+        docs = all_docs[:k]
+
+        s["context"] = format_context(docs, max_tokens=2000)
+        s["sources"] = [d.metadata.get("source", "Unknown") for d in docs]
+
+    except Exception as e:
+        s["context"] = f"Error retrieving information: {str(e)}"
+        s["sources"] = []
+
+    return s
 
 parser = StrOutputParser()
 
 def generate(s: State) -> State:
   chain = (prompt | llm | parser)
+  chat_history_formatted = format_chat_history(s.get("chat_history", []))
   s["answer"] = chain.invoke({
       "context": s.get("context", ""),
-      "question": s.get("question","")
+      "question": s.get("question", ""),
+      "chat_history": chat_history_formatted
   })
   return s
 
@@ -120,7 +175,7 @@ app = g.compile()
 
 if __name__ == "__main__":
     out = app.invoke({
-        "question": "What was the name of Rachel's sisters?",
+        "question": "Who is gunther?",
         "k": 3
     })
     print(out["answer"])
